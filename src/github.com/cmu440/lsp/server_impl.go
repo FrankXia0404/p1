@@ -55,6 +55,10 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	serverConn, err := lspnet.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &server{
 		serverConn:           serverConn,
 		newClientAddrChan:    make(chan *lspnet.UDPAddr),
