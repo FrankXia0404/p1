@@ -8,16 +8,20 @@ import (
 	"github.com/cmu440/lspnet"
 )
 
+const (
+	CLIENT_BUFFER_SIZE = 1024
+)
+
 type client struct {
-	connID         int
-	nextSeqNum     int
-	connectChan    chan bool
-	writeChan      chan []byte
-	sendChan       chan []byte
-	receiveChan    chan Message
-	readBufferChan chan Message
-	conn           *lspnet.UDPConn
-	addr           *lspnet.UDPAddr
+	connID          int
+	nextSeqNum      int
+	connectChan     chan bool
+	writeBufferChan chan Message
+	outMsgChan      chan Message
+	inMsgChan       chan Message
+	readBufferChan  chan Message
+	conn            *lspnet.UDPConn
+	serverAddr      *lspnet.UDPAddr
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -42,14 +46,13 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	}
 
 	client := &client{
-		connectChan:    make(chan bool),
-		writeChan:      make(chan []byte),
-		sendChan:       make(chan []byte),
-		receiveChan:    make(chan Message),
-		readBufferChan: make(chan Message),
-		nextSeqNum:     1,
-		conn:           conn,
-		addr:           raddr,
+		connectChan:     make(chan bool),
+		writeBufferChan: make(chan Message),
+		outMsgChan:      make(chan Message),
+		inMsgChan:       make(chan Message),
+		readBufferChan:  make(chan Message),
+		conn:            conn,
+		serverAddr:      raddr,
 	}
 
 	go client.writeToServer()
@@ -62,8 +65,8 @@ func NewClient(hostport string, params *Params) (Client, error) {
 func (c *client) connect() (Client, error) {
 	msg := NewConnect()
 	ltrace.Println("Attempt to connect")
-	buf, _ := json.Marshal(msg)
-	c.writeChan <- buf
+
+	c.writeBufferChan <- *msg
 	for _ = range c.connectChan {
 		return c, nil
 	}
@@ -71,14 +74,18 @@ func (c *client) connect() (Client, error) {
 }
 
 func (c *client) writeToServer() {
-	for msg := range c.sendChan {
-		c.conn.Write(msg)
+	for msg := range c.outMsgChan {
+		buf, err := json.Marshal(msg)
+		if err != nil {
+			ltrace.Println(err)
+		}
+		c.conn.Write(buf)
 	}
 }
 
 func (c *client) readFromServer() {
 	var msg Message
-	buf := make([]byte, BUFFER_SIZE)
+	buf := make([]byte, CLIENT_BUFFER_SIZE)
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
@@ -89,29 +96,29 @@ func (c *client) readFromServer() {
 		json.Unmarshal(buf[:n], &msg)
 		ltrace.Println("Receive message: ", msg.String())
 
-		c.receiveChan <- msg
+		c.inMsgChan <- msg
 	}
 }
 
 func (c *client) handleConnection() {
 	for {
 		select {
-		case msg := <-c.receiveChan:
+		case msg := <-c.inMsgChan:
 			switch msg.Type {
 			case MsgAck:
-				if msg.SeqNum == 0 {
+				if msg.SeqNum == INIT_SEQ_NUM {
 					c.connID = msg.ConnID
+					c.nextSeqNum = INIT_SEQ_NUM + 1
 					c.connectChan <- true
 				}
 			case MsgData:
 				c.readBufferChan <- msg
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				ltrace.Println("Send message:", ackMsg)
-				buf, _ := json.Marshal(ackMsg)
-				c.sendChan <- buf
+				c.outMsgChan <- *ackMsg
 			}
-		case msg := <-c.writeChan:
-			c.sendChan <- msg
+		case msg := <-c.writeBufferChan:
+			c.outMsgChan <- msg
 		}
 	}
 }
@@ -133,9 +140,8 @@ func (c *client) Write(payload []byte) error {
 	msg := NewData(c.connID, c.nextSeqNum, payload, nil)
 	ltrace.Println("Send message: ", msg)
 
-	buf, _ := json.Marshal(msg)
 	c.nextSeqNum++
-	c.writeChan <- buf
+	c.writeBufferChan <- *msg
 	return nil
 
 }

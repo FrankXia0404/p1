@@ -7,36 +7,39 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
-	"strconv"
 	"log"
 	"os"
+	"strconv"
 )
 
 const (
-	BUFFER_SIZE = 1024
-	INIT_SEQ    = -1
+	SERVER_BUFFER_SIZE = 1024
+	UNINIT_SEQ_NUM     = -1
+	INIT_SEQ_NUM       = 0
 )
 
-var ltrace *log.Logger = log.New(os.Stderr, "TRACE: ", log.Ldate|log.Ltime|log.Lshortfile)
+var (
+	ltrace *log.Logger = log.New(os.Stderr, "TRACE: ", log.Ldate|log.Ltime|log.Lshortfile)
+)
 
 type clientInfo struct {
-	connId      int
-	nextSeqNum  int
-	clientAddr  *lspnet.UDPAddr
-	receiveChan chan Message
-	sendChan    chan Message
+	connID     int
+	nextSeqNum int
+	clientAddr *lspnet.UDPAddr
+	inMsgChan  chan Message
+	outMsgChan chan Message
 }
 
 type server struct {
-	serverConn            *lspnet.UDPConn
-	clientConnChan        chan *lspnet.UDPAddr
-	serverReadChan        chan Message
-	serverWriteChan       chan Message
-	serverWriteOkChan     chan bool
-	serverCloseConnChan   chan int
-	serverCloseConnOkChan chan bool
-	clients               map[int]*clientInfo
-	count                 int
+	serverConn           *lspnet.UDPConn
+	clients              map[int]*clientInfo
+	newClientAddrChan    chan *lspnet.UDPAddr
+	recvMsgChan          chan Message
+	respMsgChan          chan Message
+	respErrChan          chan error
+	closeConnIdChan      chan int
+	connIdCloseErrorChan chan error
+	connIDGenerator      chan int
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -53,15 +56,15 @@ func NewServer(port int, params *Params) (Server, error) {
 
 	serverConn, err := lspnet.ListenUDP("udp", laddr)
 	s := &server{
-		serverConn:            serverConn,
-		clientConnChan:        make(chan *lspnet.UDPAddr),
-		serverReadChan:        make(chan Message),
-		serverWriteChan:       make(chan Message),
-		serverWriteOkChan:     make(chan bool),
-		serverCloseConnChan:   make(chan int),
-		serverCloseConnOkChan: make(chan bool),
-		clients:               make(map[int]*clientInfo),
-		count:                 0,
+		serverConn:           serverConn,
+		newClientAddrChan:    make(chan *lspnet.UDPAddr),
+		recvMsgChan:          make(chan Message),
+		respMsgChan:          make(chan Message),
+		respErrChan:          make(chan error),
+		closeConnIdChan:      make(chan int),
+		connIdCloseErrorChan: make(chan error),
+		clients:              make(map[int]*clientInfo),
+		connIDGenerator:      connIDs(),
 	}
 	go s.readFromClients()
 	go s.handleServerEvents()
@@ -69,7 +72,7 @@ func NewServer(port int, params *Params) (Server, error) {
 }
 
 func (s *server) readFromClients() {
-	buf := make([]byte, BUFFER_SIZE)
+	buf := make([]byte, SERVER_BUFFER_SIZE)
 	var msg Message
 	for {
 		n, clientAddr, err := s.serverConn.ReadFromUDP(buf)
@@ -83,10 +86,12 @@ func (s *server) readFromClients() {
 
 		switch msg.Type {
 		case MsgConnect:
-			s.clientConnChan <- clientAddr
+			s.newClientAddrChan <- clientAddr
 		default:
 			if c, ok := s.clients[msg.ConnID]; ok {
-				c.receiveChan <- msg
+				c.inMsgChan <- msg
+			} else {
+				ltrace.Println("ConnID not found: ", c.connID)
 			}
 		}
 	}
@@ -95,59 +100,67 @@ func (s *server) readFromClients() {
 func (s *server) handleServerEvents() {
 	for {
 		select {
-		case clientAddr := <-s.clientConnChan:
+		case clientAddr := <-s.newClientAddrChan:
 			s.addClient(clientAddr)
-		case msg := <-s.serverWriteChan:
+		case msg := <-s.respMsgChan:
 			if c, ok := s.clients[msg.ConnID]; ok {
-				s.serverWriteOkChan <- true
-				if msg.SeqNum == INIT_SEQ {
+				s.respErrChan <- nil
+				if msg.SeqNum == UNINIT_SEQ_NUM {
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum++
 				}
-				c.sendChan <- msg
+				c.outMsgChan <- msg
 			} else {
-				s.serverWriteOkChan <- false
+				err := errors.New(fmt.Sprintf("connID does not exist: %v", msg.ConnID))
+				s.respErrChan <- err
 			}
-		case connId := <-s.serverCloseConnChan:
+		case connId := <-s.closeConnIdChan:
 			if _, ok := s.clients[connId]; ok {
-				s.serverCloseConnOkChan <- true
-				delete(s.clients, connId)
+				s.connIdCloseErrorChan <- nil
+				s.removeClient(connId)
 			} else {
-				s.serverCloseConnOkChan <- false
+				err := errors.New(fmt.Sprintf("connID does not exist: %v", connId))
+				s.connIdCloseErrorChan <- err
 			}
 		}
 	}
 }
 
+func (s *server) removeClient(connId int) {
+	c := s.clients[connId]
+	close(c.inMsgChan)
+	close(c.outMsgChan)
+	delete(s.clients, connId)
+}
+
 func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 	c := clientInfo{
-		connId:      s.count,
-		nextSeqNum:  1,
-		clientAddr:  clienAddr,
-		receiveChan: make(chan Message),
-		sendChan:    make(chan Message),
+		connID:     s.generateConnID(),
+		nextSeqNum: INIT_SEQ_NUM + 1,
+		clientAddr: clienAddr,
+		inMsgChan:  make(chan Message),
+		outMsgChan: make(chan Message),
 	}
-	s.clients[c.connId] = &c
-	s.count++
-	print("New connection: ", c.connId)
+	s.clients[c.connID] = &c
+	ltrace.Println("New connection: ", c.connID)
 
-	go s.handleClientEvents(c.connId)
+	go s.handleClientEvents(c.connID)
 
-	c.sendChan <- *NewAck(c.connId, 0)
+	c.outMsgChan <- *NewAck(c.connID, INIT_SEQ_NUM)
 }
 
 func (s *server) handleClientEvents(connId int) {
 	c := s.clients[connId]
 	for {
 		select {
-		case msg := <-c.sendChan:
+		case msg := <-c.outMsgChan:
 			ltrace.Println("Sending:", msg.String())
 			buf, _ := json.Marshal(msg)
 			s.serverConn.WriteToUDP(buf, c.clientAddr)
-		case msg := <-c.receiveChan:
+		case msg := <-c.inMsgChan:
 			switch msg.Type {
 			case MsgData:
-				s.serverReadChan <- msg
+				s.recvMsgChan <- msg
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				buf, _ := json.Marshal(ackMsg)
 				ltrace.Println("Sending: ", msg.String())
@@ -158,39 +171,29 @@ func (s *server) handleClientEvents(connId int) {
 }
 
 func (s *server) Read() (int, []byte, error) {
-	if msg, open := <-s.serverReadChan; open {
+	if msg, open := <-s.recvMsgChan; open {
 		return msg.ConnID, msg.Payload, nil
-	} else {
-		return -1, nil, errors.New("Channel closed.")
 	}
+
+	return -1, nil, errors.New("Channel closed.")
 }
 
 func (s *server) Write(connID int, payload []byte) error {
 	// TODO add hash
-	msg := NewData(connID, INIT_SEQ, payload, nil)
+	msg := NewData(connID, UNINIT_SEQ_NUM, payload, nil)
 
-	s.serverWriteChan <- *msg
-	if ok, open := <-s.serverWriteOkChan; open {
-		switch ok {
-		case true:
-			return nil
-		case false:
-			return errors.New(fmt.Sprintf("connID does not exist: %v", connID))
-		}
+	s.respMsgChan <- *msg
+	if err, open := <-s.respErrChan; open {
+		return err
 	}
 
 	return errors.New("Channel closed")
 }
 
 func (s *server) CloseConn(connID int) error {
-	s.serverCloseConnChan <- connID
-	if ok, open := <-s.serverCloseConnOkChan; open {
-		switch ok {
-		case true:
-			return nil
-		case false:
-			return errors.New(fmt.Sprintf("connID does not exist: %v", connID))
-		}
+	s.closeConnIdChan <- connID
+	if err, open := <-s.connIdCloseErrorChan; open {
+		return err
 	}
 
 	return errors.New("Channel closed")
@@ -198,4 +201,20 @@ func (s *server) CloseConn(connID int) error {
 
 func (s *server) Close() error {
 	return errors.New("not yet implemented")
+}
+
+func connIDs() chan int {
+	yield := make(chan int)
+	count := 0
+	go func() {
+		for {
+			yield <- count
+			count++
+		}
+	}()
+	return yield
+}
+
+func (s *server) generateConnID() int {
+	return <-s.connIDGenerator
 }
