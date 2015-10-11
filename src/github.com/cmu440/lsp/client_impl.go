@@ -3,9 +3,12 @@
 package lsp
 
 import (
+	"crypto/md5"
 	"encoding/json"
 	"errors"
 	"github.com/cmu440/lspnet"
+	"reflect"
+	"strconv"
 )
 
 const (
@@ -67,10 +70,15 @@ func (c *client) connect() (Client, error) {
 	ltrace.Println("Attempt to connect")
 
 	c.writeBufferChan <- *msg
-	for _ = range c.connectChan {
-		return c, nil
+	if isConnected, open := <-c.connectChan; open {
+		if isConnected {
+			return c, nil
+		} else {
+			return nil, errors.New("Connection failed")
+		}
+	} else {
+		return nil, errors.New("Connection closed")
 	}
-	return nil, errors.New("Connection closed")
 }
 
 func (c *client) writeToServer() {
@@ -94,8 +102,12 @@ func (c *client) readFromServer() {
 		}
 
 		json.Unmarshal(buf[:n], &msg)
-		ltrace.Println("Receive message: ", msg.String())
+		if !IsMsgIntegrated(&msg) {
+			ltrace.Println("Message corrupted: ", msg)
+			continue
+		}
 
+		ltrace.Println("Receive message: ", msg.String())
 		c.inMsgChan <- msg
 	}
 }
@@ -136,8 +148,7 @@ func (c *client) Read() ([]byte, error) {
 }
 
 func (c *client) Write(payload []byte) error {
-	// TODO add hash
-	msg := NewData(c.connID, c.nextSeqNum, payload, nil)
+	msg := NewDataWithHash(c.connID, c.nextSeqNum, payload)
 	ltrace.Println("Send message: ", msg)
 
 	c.nextSeqNum++
@@ -148,4 +159,23 @@ func (c *client) Write(payload []byte) error {
 
 func (c *client) Close() error {
 	return errors.New("not yet implemented")
+}
+
+func NewDataWithHash(connID, seqNum int, payload []byte) *Message {
+	md5 := md5.New()
+	md5.Write([]byte(strconv.Itoa(connID)))
+	md5.Write([]byte(strconv.Itoa(seqNum)))
+	md5.Write(payload)
+	hash := md5.Sum(make([]byte, 0))
+	return NewData(connID, seqNum, payload, hash)
+}
+
+func IsMsgIntegrated(msg *Message) bool {
+	switch msg.Type {
+	case MsgData:
+		newMsg := NewDataWithHash(msg.ConnID, msg.SeqNum, msg.Payload)
+		return reflect.DeepEqual(msg.Hash, newMsg.Hash)
+	default:
+		return true
+	}
 }

@@ -86,8 +86,12 @@ func (s *server) readFromClients() {
 		}
 
 		json.Unmarshal(buf[:n], &msg)
-		ltrace.Println(msg.String())
+		if !IsMsgIntegrated(&msg) {
+			ltrace.Println("Message corrupted: ", msg)
+			break
+		}
 
+		ltrace.Println(msg.String())
 		switch msg.Type {
 		case MsgConnect:
 			s.newClientAddrChan <- clientAddr
@@ -109,9 +113,11 @@ func (s *server) handleServerEvents() {
 		case msg := <-s.respMsgChan:
 			if c, ok := s.clients[msg.ConnID]; ok {
 				s.respErrChan <- nil
-				if msg.SeqNum == UNINIT_SEQ_NUM {
+				switch msg.Type {
+				case MsgData:
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum++
+					msg = *NewDataWithHash(msg.ConnID, msg.SeqNum, msg.Payload)
 				}
 				c.outMsgChan <- msg
 			} else {
@@ -162,12 +168,13 @@ func (s *server) handleClientEvents(connId int) {
 			buf, _ := json.Marshal(msg)
 			s.serverConn.WriteToUDP(buf, c.clientAddr)
 		case msg := <-c.inMsgChan:
+
 			switch msg.Type {
 			case MsgData:
 				s.recvMsgChan <- msg
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				buf, _ := json.Marshal(ackMsg)
-				ltrace.Println("Sending: ", msg.String())
+				ltrace.Println("Sending: ", ackMsg.String())
 				s.serverConn.WriteToUDP(buf, c.clientAddr)
 			}
 		}
@@ -183,7 +190,6 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) Write(connID int, payload []byte) error {
-	// TODO add hash
 	msg := NewData(connID, UNINIT_SEQ_NUM, payload, nil)
 
 	s.respMsgChan <- *msg
