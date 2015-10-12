@@ -28,6 +28,7 @@ type clientInfo struct {
 	clientAddr *lspnet.UDPAddr
 	inMsgChan  chan Message
 	outMsgChan chan Message
+	seqOrg *SeqOrganizor
 }
 
 type server struct {
@@ -88,7 +89,7 @@ func (s *server) readFromClients() {
 		json.Unmarshal(buf[:n], &msg)
 		if !IsMsgIntegrated(&msg) {
 			ltrace.Println("Message corrupted: ", msg)
-			break
+			continue
 		}
 
 		ltrace.Println(msg.String())
@@ -151,6 +152,11 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 		inMsgChan:  make(chan Message),
 		outMsgChan: make(chan Message),
 	}
+	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM + 1)
+	if err != nil {
+		ltrace.Fatal(err)
+	}
+	c.seqOrg = seqOrg
 	s.clients[c.connID] = &c
 	ltrace.Println("New connection: ", c.connID)
 
@@ -171,7 +177,7 @@ func (s *server) handleClientEvents(connId int) {
 
 			switch msg.Type {
 			case MsgData:
-				s.recvMsgChan <- msg
+				c.seqOrg.AddMsg(msg)
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				buf, _ := json.Marshal(ackMsg)
 				ltrace.Println("Sending: ", ackMsg.String())
