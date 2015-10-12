@@ -25,6 +25,7 @@ type client struct {
 	readBufferChan  chan Message
 	conn            *lspnet.UDPConn
 	serverAddr      *lspnet.UDPAddr
+	seqOrg *SeqOrganizor
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -121,10 +122,17 @@ func (c *client) handleConnection() {
 				if msg.SeqNum == INIT_SEQ_NUM {
 					c.connID = msg.ConnID
 					c.nextSeqNum = INIT_SEQ_NUM + 1
+
+					seqOrg, err := NewSeqOrganizor(c.readBufferChan, INIT_SEQ_NUM + 1)
+					if err != nil {
+						ltrace.Println(err)
+						break
+					}
+					c.seqOrg = seqOrg
 					c.connectChan <- true
 				}
 			case MsgData:
-				c.readBufferChan <- msg
+				c.seqOrg.AddMsg(msg)
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				ltrace.Println("Send message:", ackMsg)
 				c.outMsgChan <- *ackMsg
