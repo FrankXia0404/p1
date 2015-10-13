@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 )
 
 const (
@@ -23,13 +24,15 @@ var (
 )
 
 type clientInfo struct {
-	connID     int
-	nextSeqNum int
-	clientAddr *lspnet.UDPAddr
-	inMsgChan  chan Message
-	outMsgChan chan Message
-	seqOrg     *seqOrganizer
-	win        *slidingWindow
+	connID              int
+	nextSeqNum          int
+	clientAddr          *lspnet.UDPAddr
+	inMsgChan           chan Message
+	outMsgChan          chan Message
+	seqOrg              *seqOrganizer
+	win                 *slidingWindow
+	resetEpochCountChan chan bool
+	epochCountChan      chan int
 }
 
 type server struct {
@@ -102,6 +105,7 @@ func (s *server) readFromClients() {
 		default:
 			if c, ok := s.clients[msg.ConnID]; ok {
 				c.inMsgChan <- msg
+				c.resetEpochCountChan <- true
 			} else {
 				ltrace.Println("ConnID not found: ", c.connID)
 			}
@@ -122,8 +126,8 @@ func (s *server) handleServerEvents() {
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum++
 					msg = *NewDataWithHash(msg.ConnID, msg.SeqNum, msg.Payload)
+					c.win.addMsg(msg)
 				}
-				c.win.addMsg(msg)
 			} else {
 				err := errors.New(fmt.Sprintf("connID does not exist: %v", msg.ConnID))
 				s.respErrChan <- err
@@ -149,11 +153,13 @@ func (s *server) removeClient(connId int) {
 
 func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 	c := clientInfo{
-		connID:     s.generateConnID(),
-		nextSeqNum: INIT_SEQ_NUM + 1,
-		clientAddr: clienAddr,
-		inMsgChan:  make(chan Message),
-		outMsgChan: make(chan Message),
+		connID:              s.generateConnID(),
+		nextSeqNum:          INIT_SEQ_NUM + 1,
+		clientAddr:          clienAddr,
+		inMsgChan:           make(chan Message),
+		outMsgChan:          make(chan Message),
+		resetEpochCountChan: make(chan bool),
+		epochCountChan:      make(chan int),
 	}
 	// Sequence
 	seqOrg, err := NewSeqOrganizer(s.recvMsgChan, INIT_SEQ_NUM+1)
@@ -170,6 +176,7 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 	ltrace.Println("New connection: ", c.connID)
 
 	go s.handleClientEvents(c.connID)
+	go epochServer(c.connID, c.resetEpochCountChan, time.Duration(s.params.EpochMillis)*time.Millisecond, s.fireEpoch, c.epochCountChan)
 
 	c.outMsgChan <- *NewAck(c.connID, INIT_SEQ_NUM)
 }
@@ -193,6 +200,10 @@ func (s *server) handleClientEvents(connId int) {
 				s.serverConn.WriteToUDP(buf, c.clientAddr)
 			case MsgAck:
 				c.win.ack(msg)
+			}
+		case count := <-c.epochCountChan:
+			if count == s.params.EpochLimit {
+				s.CloseConn(c.connID)
 			}
 		}
 	}
@@ -244,4 +255,17 @@ func connIDs() chan int {
 
 func (s *server) generateConnID() int {
 	return <-s.connIDGenerator
+}
+
+func (s *server) fireEpoch(connId int) {
+	c := s.clients[connId]
+
+	if c.seqOrg.expSeqNum == INIT_SEQ_NUM+1 {
+		msg := NewAck(c.connID, 0)
+		ltrace.Println("Epoch: Resend connect ack")
+		c.outMsgChan <- *msg
+	}
+
+	ltrace.Println("Epoch: Resend window")
+	c.win.fireEpoch()
 }

@@ -24,6 +24,9 @@ func newWindow(outMsgChan chan Message, winSize, initSeq int) (*slidingWindow, e
 }
 
 func (win *slidingWindow) addMsg(msg Message) {
+	if msg.Type == MsgConnect {
+		ltrace.Fatal("receive msg connect")
+	}
 	record := msgRecord{
 		msg:     msg,
 		isSent:  false,
@@ -62,4 +65,13 @@ func (win *slidingWindow) updateWindow() {
 	win.msgWindow = win.msgWindow[offset:]
 	win.minSeqNum += offset
 	win.sendMsgs()
+}
+
+func (win *slidingWindow) fireEpoch() {
+	ltrace.Println("Epoch Window: ", win.msgWindow)
+	for i := 0; i < len(win.msgWindow) && i < win.winSize; i++ {
+		if win.msgWindow[i].isSent && !win.msgWindow[i].isAcked {
+			win.outMsgChan <- win.msgWindow[i].msg
+		}
+	}
 }

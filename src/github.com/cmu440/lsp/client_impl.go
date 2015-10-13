@@ -9,6 +9,7 @@ import (
 	"github.com/cmu440/lspnet"
 	"reflect"
 	"strconv"
+	"time"
 )
 
 const (
@@ -28,6 +29,8 @@ type client struct {
 	seqOrg          *seqOrganizer
 	win             *slidingWindow
 	params          *Params
+	resetEpochCountChan chan bool
+	epochCountChan chan int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -60,11 +63,16 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		conn:            conn,
 		serverAddr:      raddr,
 		params:          params,
+		nextSeqNum:      INIT_SEQ_NUM,
+		resetEpochCountChan: make(chan bool),
+		epochCountChan: make(chan int),
 	}
 
 	go client.writeToServer()
 	go client.readFromServer()
 	go client.handleConnection()
+
+	go epoch(client.resetEpochCountChan, time.Duration(client.params.EpochMillis) * time.Millisecond, client.fireEpoch, client.epochCountChan)
 
 	return client.connect()
 }
@@ -113,6 +121,7 @@ func (c *client) readFromServer() {
 
 		ltrace.Println("Receive message: ", msg.String())
 		c.inMsgChan <- msg
+		c.resetEpochCountChan <- true
 	}
 }
 
@@ -149,6 +158,10 @@ func (c *client) handleConnection() {
 			}
 		case msg := <-c.writeBufferChan:
 			c.win.addMsg(msg)
+		case count := <-c.epochCountChan:
+			if count == c.params.EpochLimit {
+				c.Close()
+			}
 		}
 	}
 }
@@ -196,4 +209,20 @@ func IsMsgIntegrated(msg *Message) bool {
 	default:
 		return true
 	}
+}
+
+func (c *client) fireEpoch() {
+	if c.nextSeqNum == INIT_SEQ_NUM {
+		msg := NewConnect()
+		ltrace.Println("Epoch: Attempt to connect")
+		c.outMsgChan <- *msg
+	}
+
+	if c.seqOrg.expSeqNum == INIT_SEQ_NUM + 1 {
+		msg := NewAck(c.connID, 0)
+		ltrace.Println("Epoch: Resend connect ack")
+		c.outMsgChan <- *msg
+	}
+
+	c.win.fireEpoch()
 }
