@@ -28,8 +28,7 @@ type clientInfo struct {
 	clientAddr *lspnet.UDPAddr
 	inMsgChan  chan Message
 	outMsgChan chan Message
-	seqOrg     *seqOrganizer
-	win        *slidingWindow
+	seqOrg *SeqOrganizor
 }
 
 type server struct {
@@ -42,7 +41,6 @@ type server struct {
 	closeConnIdChan      chan int
 	connIdCloseErrorChan chan error
 	connIDGenerator      chan int
-	params               *Params
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -72,7 +70,6 @@ func NewServer(port int, params *Params) (Server, error) {
 		connIdCloseErrorChan: make(chan error),
 		clients:              make(map[int]*clientInfo),
 		connIDGenerator:      connIDs(),
-		params:               params,
 	}
 	go s.readFromClients()
 	go s.handleServerEvents()
@@ -123,7 +120,7 @@ func (s *server) handleServerEvents() {
 					c.nextSeqNum++
 					msg = *NewDataWithHash(msg.ConnID, msg.SeqNum, msg.Payload)
 				}
-				c.win.addMsg(msg)
+				c.outMsgChan <- msg
 			} else {
 				err := errors.New(fmt.Sprintf("connID does not exist: %v", msg.ConnID))
 				s.respErrChan <- err
@@ -155,17 +152,11 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 		inMsgChan:  make(chan Message),
 		outMsgChan: make(chan Message),
 	}
-	// Sequence
-	seqOrg, err := NewSeqOrganizer(s.recvMsgChan, INIT_SEQ_NUM+1)
+	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM + 1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
 	c.seqOrg = seqOrg
-
-	// Sliding window
-	win, err := newWindow(c.outMsgChan, s.params.WindowSize, c.nextSeqNum)
-	c.win = win
-
 	s.clients[c.connID] = &c
 	ltrace.Println("New connection: ", c.connID)
 
@@ -191,8 +182,6 @@ func (s *server) handleClientEvents(connId int) {
 				buf, _ := json.Marshal(ackMsg)
 				ltrace.Println("Sending: ", ackMsg.String())
 				s.serverConn.WriteToUDP(buf, c.clientAddr)
-			case MsgAck:
-				c.win.ack(msg)
 			}
 		}
 	}

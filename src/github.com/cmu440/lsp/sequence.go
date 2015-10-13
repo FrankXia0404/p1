@@ -1,13 +1,13 @@
 package lsp
 
-type seqOrganizer struct {
+type SeqOrganizor struct {
 	outMsgChan chan<- Message
 	msgMap     map[int]Message
 	expSeqNum  int
 }
 
-func NewSeqOrganizer(outMsgChan chan Message, initSeqNum int) (*seqOrganizer, error) {
-	seq := new(seqOrganizer)
+func NewSeqOrganizor(outMsgChan chan Message, initSeqNum int) (*SeqOrganizor, error) {
+	seq := new(SeqOrganizor)
 	seq.outMsgChan = outMsgChan
 	seq.expSeqNum = initSeqNum
 
@@ -16,7 +16,7 @@ func NewSeqOrganizer(outMsgChan chan Message, initSeqNum int) (*seqOrganizer, er
 	return seq, nil
 }
 
-func (seq *seqOrganizer) AddMsg(msg Message) error {
+func (seq *SeqOrganizor) AddMsg(msg Message) error {
 	ltrace.Println("seq add:", msg)
 	if msg.SeqNum < seq.expSeqNum {
 		return nil
@@ -37,7 +37,7 @@ func (seq *seqOrganizer) AddMsg(msg Message) error {
 	return nil
 }
 
-func (seq *seqOrganizer) updateMsgMap() {
+func (seq *SeqOrganizor) updateMsgMap() {
 	for {
 		if msg, ok := seq.msgMap[seq.expSeqNum]; ok {
 			delete(seq.msgMap, seq.expSeqNum)
