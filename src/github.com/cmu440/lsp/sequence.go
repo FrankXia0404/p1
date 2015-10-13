@@ -12,12 +12,10 @@ func NewSeqOrganizor(outMsgChan chan Message, initSeqNum int) (*SeqOrganizor, er
 	seq.expSeqNum = initSeqNum
 
 	seq.msgMap = make(map[int]Message)
-	//	go seq.popNextMsg()
 	return seq, nil
 }
 
 func (seq *SeqOrganizor) AddMsg(msg Message) error {
-	ltrace.Println("seq add:", msg)
 	if msg.SeqNum < seq.expSeqNum {
 		return nil
 	}

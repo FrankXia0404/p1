@@ -88,6 +88,7 @@ func (c *client) writeToServer() {
 		if err != nil {
 			ltrace.Println(err)
 		}
+		ltrace.Printf("Client%d Write: %v", c.connID, msgString(msg))
 		c.conn.Write(buf)
 	}
 }
@@ -108,7 +109,6 @@ func (c *client) readFromServer() {
 			continue
 		}
 
-		ltrace.Println("Receive message: ", msg.String())
 		c.inMsgChan <- msg
 	}
 }
@@ -134,7 +134,6 @@ func (c *client) handleConnection() {
 			case MsgData:
 				c.seqOrg.AddMsg(msg)
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
-				ltrace.Println("Send message:", ackMsg)
 				c.outMsgChan <- *ackMsg
 			}
 		case msg := <-c.writeBufferChan:
@@ -149,6 +148,7 @@ func (c *client) ConnID() int {
 
 func (c *client) Read() ([]byte, error) {
 	if msg, open := <-c.readBufferChan; open {
+		ltrace.Printf("Client%d Read: %v", c.connID, msgString(msg))
 		return msg.Payload, nil
 	} else {
 		return nil, errors.New("Channel closed")
@@ -157,7 +157,6 @@ func (c *client) Read() ([]byte, error) {
 
 func (c *client) Write(payload []byte) error {
 	msg := NewDataWithHash(c.connID, c.nextSeqNum, payload)
-	ltrace.Println("Send message: ", msg)
 
 	c.nextSeqNum++
 	c.writeBufferChan <- *msg

@@ -28,7 +28,7 @@ type clientInfo struct {
 	clientAddr *lspnet.UDPAddr
 	inMsgChan  chan Message
 	outMsgChan chan Message
-	seqOrg *SeqOrganizor
+	seqOrg     *SeqOrganizor
 }
 
 type server struct {
@@ -92,12 +92,13 @@ func (s *server) readFromClients() {
 			continue
 		}
 
-		ltrace.Println(msg.String())
 		switch msg.Type {
 		case MsgConnect:
+
 			s.newClientAddrChan <- clientAddr
 		default:
 			if c, ok := s.clients[msg.ConnID]; ok {
+				ltrace.Printf("Server revc from C%d: %v", c.connID, msgString(msg))
 				c.inMsgChan <- msg
 			} else {
 				ltrace.Println("ConnID not found: ", c.connID)
@@ -152,16 +153,16 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 		inMsgChan:  make(chan Message),
 		outMsgChan: make(chan Message),
 	}
-	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM + 1)
+	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM+1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
 	c.seqOrg = seqOrg
 	s.clients[c.connID] = &c
-	ltrace.Println("New connection: ", c.connID)
 
 	go s.handleClientEvents(c.connID)
 
+	ltrace.Printf("Server new C%d: %v", c.connID, clienAddr)
 	c.outMsgChan <- *NewAck(c.connID, INIT_SEQ_NUM)
 }
 
@@ -170,17 +171,15 @@ func (s *server) handleClientEvents(connId int) {
 	for {
 		select {
 		case msg := <-c.outMsgChan:
-			ltrace.Println("Sending:", msg.String())
+		ltrace.Printf("Server C%d wirte: %v", c.connID, msgString(msg))
 			buf, _ := json.Marshal(msg)
 			s.serverConn.WriteToUDP(buf, c.clientAddr)
 		case msg := <-c.inMsgChan:
-
 			switch msg.Type {
 			case MsgData:
 				c.seqOrg.AddMsg(msg)
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				buf, _ := json.Marshal(ackMsg)
-				ltrace.Println("Sending: ", ackMsg.String())
 				s.serverConn.WriteToUDP(buf, c.clientAddr)
 			}
 		}
@@ -233,4 +232,18 @@ func connIDs() chan int {
 
 func (s *server) generateConnID() int {
 	return <-s.connIDGenerator
+}
+
+func msgString(m Message) string {
+	var name, payload string
+	switch m.Type {
+	case MsgConnect:
+		name = "Connect"
+	case MsgData:
+		name = "Data"
+		payload = " " + string(m.Payload)
+	case MsgAck:
+		name = "Ack"
+	}
+	return fmt.Sprintf("[%s %d %d %s]", name, m.ConnID, m.SeqNum, payload)
 }
