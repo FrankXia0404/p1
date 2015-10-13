@@ -23,14 +23,15 @@ var (
 )
 
 type clientInfo struct {
-	connID     int
-	nextSeqNum int
-	clientAddr *lspnet.UDPAddr
-	inMsgChan  chan Message
-	outMsgChan chan Message
-	seqOrg     *SeqOrganizor
-	wind       *slidingWindow
-	params     *Params
+	connID         int
+	nextSeqNum     int
+	clientAddr     *lspnet.UDPAddr
+	inMsgChan      chan Message
+	outMsgChan     chan Message
+	seqOrg         *SeqOrganizer
+	wind           *slidingWindow
+	params         *Params
+	forceCloseChan chan bool
 }
 
 type server struct {
@@ -44,6 +45,7 @@ type server struct {
 	connIdCloseErrorChan chan error
 	connIDGenerator      chan int
 	params               *Params
+	forceCloseChan       chan bool
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -72,9 +74,10 @@ func NewServer(port int, params *Params) (Server, error) {
 		closeConnIdChan:      make(chan int),
 		connIdCloseErrorChan: make(chan error),
 		clients:              make(map[int]*clientInfo),
-		connIDGenerator:      connIDs(),
 		params:               params,
+		forceCloseChan:       make(chan bool),
 	}
+	s.connIDGenerator = s.connIDs()
 	go s.readFromClients()
 	go s.handleServerEvents()
 	return s, nil
@@ -108,6 +111,12 @@ func (s *server) readFromClients() {
 				ltrace.Println("ConnID not found: ", c.connID)
 			}
 		}
+
+		select {
+		case <-s.forceCloseChan:
+			return
+			default:
+		}
 	}
 }
 
@@ -135,40 +144,55 @@ func (s *server) handleServerEvents() {
 		case connId := <-s.closeConnIdChan:
 			if _, ok := s.clients[connId]; ok {
 				s.connIdCloseErrorChan <- nil
-				s.removeClient(connId)
+				s.clients[connId].Close()
+				delete(s.clients, connId)
 			} else {
 				err := errors.New(fmt.Sprintf("connID does not exist: %v", connId))
 				s.connIdCloseErrorChan <- err
 			}
+		case <-s.forceCloseChan:
+			return
 		}
 	}
 }
 
-func (s *server) removeClient(connId int) {
-	c := s.clients[connId]
+func (c *clientInfo) Close() {
+	c.wind.Close()
+	c.seqOrg.Close()
 	close(c.inMsgChan)
 	close(c.outMsgChan)
-	delete(s.clients, connId)
+
+	close(c.forceCloseChan)
+}
+
+func (c *clientInfo) ForceClose() {
+	c.wind.ForceClose()
+	c.seqOrg.ForceClose()
+
+	close(c.inMsgChan)
+	close(c.outMsgChan)
+	close(c.forceCloseChan)
 }
 
 func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 	c := clientInfo{
-		connID:     s.generateConnID(),
-		nextSeqNum: INIT_SEQ_NUM + 1,
-		clientAddr: clienAddr,
-		inMsgChan:  make(chan Message),
-		outMsgChan: make(chan Message),
-		params: s.params,
+		connID:         s.generateConnID(),
+		nextSeqNum:     INIT_SEQ_NUM + 1,
+		clientAddr:     clienAddr,
+		inMsgChan:      make(chan Message),
+		outMsgChan:     make(chan Message),
+		params:         s.params,
+		forceCloseChan: make(chan bool),
 	}
 	// sequence
-	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM+1)
+	seqOrg, err := NewSeqOrganizer(s.recvMsgChan, INIT_SEQ_NUM+1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
 	c.seqOrg = seqOrg
 
 	// Sliding window
-	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM + 1)
+	wind, err := NewWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM+1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
@@ -202,6 +226,8 @@ func (s *server) handleClientEvents(connId int) {
 			case MsgConnect:
 				ltrace.Fatal(msgString(msg))
 			}
+		case <-s.forceCloseChan:
+			return
 		}
 	}
 }
@@ -235,16 +261,37 @@ func (s *server) CloseConn(connID int) error {
 }
 
 func (s *server) Close() error {
-	return errors.New("not yet implemented")
+	for _, client := range s.clients {
+		client.Close()
+	}
+	close(s.forceCloseChan)
+	close(s.connIDGenerator)
+	close(s.newClientAddrChan)
+	close(s.recvMsgChan)
+	close(s.respMsgChan)
+	close(s.respErrChan)
+	close(s.closeConnIdChan)
+	close(s.connIdCloseErrorChan)
+	return nil
 }
 
-func connIDs() chan int {
+func (s *server) ForceClose() {
+	close(s.forceCloseChan)
+}
+
+func (s *server) connIDs() chan int {
 	yield := make(chan int)
 	count := 0
 	go func() {
 		for {
 			yield <- count
 			count++
+
+			select {
+			case <-s.forceCloseChan:
+				return
+			default:
+			}
 		}
 	}()
 	return yield

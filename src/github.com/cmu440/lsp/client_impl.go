@@ -25,9 +25,10 @@ type client struct {
 	readBufferChan  chan Message
 	conn            *lspnet.UDPConn
 	serverAddr      *lspnet.UDPAddr
-	seqOrg          *SeqOrganizor
+	seqOrg          *SeqOrganizer
 	wind            *slidingWindow
 	params          *Params
+	forceCloseChan  chan bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -60,6 +61,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		conn:            conn,
 		serverAddr:      raddr,
 		params:          params,
+		forceCloseChan:  make(chan bool),
 	}
 
 	go client.writeToServer()
@@ -70,7 +72,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 }
 
 func (c *client) initSeq() {
-	seqOrg, err := NewSeqOrganizor(c.readBufferChan, INIT_SEQ_NUM+1)
+	seqOrg, err := NewSeqOrganizer(c.readBufferChan, INIT_SEQ_NUM+1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
@@ -78,7 +80,7 @@ func (c *client) initSeq() {
 }
 
 func (c *client) initWindow() {
-	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM+1)
+	wind, err := NewWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM+1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
@@ -104,14 +106,20 @@ func (c *client) connect() (Client, error) {
 }
 
 func (c *client) writeToServer() {
-	for msg := range c.outMsgChan {
-		buf, err := json.Marshal(msg)
-		if err != nil {
-			ltrace.Println(err)
+	for {
+		select {
+		case msg := <-c.outMsgChan:
+			buf, err := json.Marshal(msg)
+			if err != nil {
+				ltrace.Println(err)
+			}
+			ltrace.Printf("Client%d Write: %v", c.connID, msgString(msg))
+			c.conn.Write(buf)
+		case <-c.forceCloseChan:
+			return
 		}
-		ltrace.Printf("Client%d Write: %v", c.connID, msgString(msg))
-		c.conn.Write(buf)
 	}
+
 }
 
 func (c *client) readFromServer() {
@@ -132,6 +140,12 @@ func (c *client) readFromServer() {
 
 		ltrace.Printf("Client%d Read: %v", c.connID, msgString(msg))
 		c.inMsgChan <- msg
+
+		select {
+		case <-c.forceCloseChan:
+			return
+		default:
+		}
 	}
 }
 
@@ -157,6 +171,8 @@ func (c *client) handleConnection() {
 			}
 		case msg := <-c.writeBufferChan:
 			c.wind.AddMsg(msg)
+		case <-c.forceCloseChan:
+			return
 		}
 	}
 }
@@ -184,7 +200,25 @@ func (c *client) Write(payload []byte) error {
 }
 
 func (c *client) Close() error {
-	return errors.New("not yet implemented")
+	c.wind.Close()
+	c.seqOrg.Close()
+	close(c.connectChan)
+
+	// Close read channels in order
+	close(c.inMsgChan)
+	close(c.readBufferChan)
+	// Close write channels in order
+	close(c.writeBufferChan)
+	close(c.outMsgChan)
+
+	close(c.forceCloseChan)
+	return nil
+}
+
+func (c *client) ForceClose() {
+	c.wind.ForceClose()
+	c.seqOrg.ForceClose()
+	close(c.forceCloseChan)
 }
 
 func NewDataWithHash(connID, seqNum int, payload []byte) *Message {

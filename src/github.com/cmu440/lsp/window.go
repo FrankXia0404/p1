@@ -1,11 +1,14 @@
 package lsp
 
 type slidingWindow struct {
-	packets    []packet
-	outMsgChan chan<- Message
-	minSeqNum  int
-	winSize    int
-	reqChan    chan windRequest
+	packets        []packet
+	packetLen      int
+	outMsgChan     chan<- Message
+	minSeqNum      int
+	winSize        int
+	reqChan        chan windRequest
+	cleanCloseChan chan bool
+	forceCloseChan chan bool
 }
 
 type packet struct {
@@ -28,13 +31,43 @@ type windRequest struct {
 	retChan chan error
 }
 
-func newWindow(outMsgChan chan Message, winSize, initSeq int) (*slidingWindow, error) {
+func (w *slidingWindow) Close() {
+	if w.packetLen != 0 {
+		zeroLen := make(chan bool)
+		go func() {
+			for {
+				if w.packetLen == 0 {
+					zeroLen <- true
+					return
+				}
+
+				select {
+				case <-w.forceCloseChan:
+					return
+				default:
+				}
+			}
+		}()
+		<-zeroLen
+	}
+	w.cleanCloseChan <- true
+	close(w.cleanCloseChan)
+	close(w.forceCloseChan)
+}
+
+func (w *slidingWindow) ForceClose() {
+	close(w.forceCloseChan)
+}
+
+func NewWindow(outMsgChan chan Message, winSize, initSeq int) (*slidingWindow, error) {
 	w := &slidingWindow{
-		packets:    make([]packet, 0),
-		outMsgChan: outMsgChan,
-		minSeqNum:  initSeq,
-		winSize:    winSize,
-		reqChan:    make(chan windRequest),
+		packets:        make([]packet, 0),
+		outMsgChan:     outMsgChan,
+		minSeqNum:      initSeq,
+		winSize:        winSize,
+		reqChan:        make(chan windRequest),
+		cleanCloseChan: make(chan bool),
+		forceCloseChan: make(chan bool),
 	}
 	go w.runWindow()
 	return w, nil
@@ -66,6 +99,10 @@ func (w *slidingWindow) runWindow() {
 				w.updateWindow()
 				req.retChan <- nil
 			}
+		case <-w.cleanCloseChan:
+			return
+		case <-w.forceCloseChan:
+			return
 		}
 	}
 }
@@ -73,6 +110,12 @@ func (w *slidingWindow) runWindow() {
 func (w *slidingWindow) Ack(acMsg Message) error {
 	errChan := make(chan error)
 	w.reqChan <- windRequest{reqType: WindAck, param: acMsg, retChan: errChan}
+
+	if err := <-errChan; err != nil {
+		return err
+	}
+
+	w.reqChan <- windRequest{reqType: WindUpdate, retChan: errChan}
 	return <-errChan
 }
 
@@ -106,8 +149,7 @@ func (w *slidingWindow) updateWindow() {
 		offset++
 	}
 	w.packets = w.packets[offset:]
+	w.packetLen = len(w.packets)
 	w.minSeqNum += offset
 	w.sendMsgs()
-
-	ltrace.Printf("Window size: %d %v", len(w.packets), w.packets)
 }
