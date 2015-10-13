@@ -68,11 +68,14 @@ func (seq *SeqOrganizor) updateMsgMap() {
 }
 
 func (seq *SeqOrganizor) runSeqOrg() {
-	for req := range seq.reqChan {
-		switch req.reqType {
-		case SeqAdd:
-			err := seq.addMsg(req.param)
-			req.retChan <- err
+	for{
+		select {
+		case req := <- seq.reqChan:
+			switch req.reqType {
+			case SeqAdd:
+				err := seq.addMsg(req.param)
+				req.retChan <- err
+			}
 		}
 	}
 }

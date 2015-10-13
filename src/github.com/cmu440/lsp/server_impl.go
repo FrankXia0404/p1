@@ -29,6 +29,8 @@ type clientInfo struct {
 	inMsgChan  chan Message
 	outMsgChan chan Message
 	seqOrg     *SeqOrganizor
+	wind       *slidingWindow
+	params     *Params
 }
 
 type server struct {
@@ -41,6 +43,7 @@ type server struct {
 	closeConnIdChan      chan int
 	connIdCloseErrorChan chan error
 	connIDGenerator      chan int
+	params               *Params
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -70,6 +73,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		connIdCloseErrorChan: make(chan error),
 		clients:              make(map[int]*clientInfo),
 		connIDGenerator:      connIDs(),
+		params:               params,
 	}
 	go s.readFromClients()
 	go s.handleServerEvents()
@@ -120,8 +124,10 @@ func (s *server) handleServerEvents() {
 					msg.SeqNum = c.nextSeqNum
 					c.nextSeqNum++
 					msg = *NewDataWithHash(msg.ConnID, msg.SeqNum, msg.Payload)
+					c.wind.AddMsg(msg)
+				default:
+					ltrace.Fatal(msgString(msg))
 				}
-				c.outMsgChan <- msg
 			} else {
 				err := errors.New(fmt.Sprintf("connID does not exist: %v", msg.ConnID))
 				s.respErrChan <- err
@@ -152,17 +158,27 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 		clientAddr: clienAddr,
 		inMsgChan:  make(chan Message),
 		outMsgChan: make(chan Message),
+		params: s.params,
 	}
+	// sequence
 	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM+1)
 	if err != nil {
 		ltrace.Fatal(err)
 	}
 	c.seqOrg = seqOrg
+
+	// Sliding window
+	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM + 1)
+	if err != nil {
+		ltrace.Fatal(err)
+	}
+	c.wind = wind
+
 	s.clients[c.connID] = &c
 
 	go s.handleClientEvents(c.connID)
 
-	ltrace.Printf("Server new C%d: %v", c.connID, clienAddr)
+	ltrace.Printf("Server new conn %d: %v", c.connID, clienAddr)
 	c.outMsgChan <- *NewAck(c.connID, INIT_SEQ_NUM)
 }
 
@@ -171,7 +187,7 @@ func (s *server) handleClientEvents(connId int) {
 	for {
 		select {
 		case msg := <-c.outMsgChan:
-		ltrace.Printf("Server C%d wirte: %v", c.connID, msgString(msg))
+			ltrace.Printf("Server C%d wirte: %v", c.connID, msgString(msg))
 			buf, _ := json.Marshal(msg)
 			s.serverConn.WriteToUDP(buf, c.clientAddr)
 		case msg := <-c.inMsgChan:
@@ -181,6 +197,10 @@ func (s *server) handleClientEvents(connId int) {
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
 				buf, _ := json.Marshal(ackMsg)
 				s.serverConn.WriteToUDP(buf, c.clientAddr)
+			case MsgAck:
+				c.wind.Ack(msg)
+			case MsgConnect:
+				ltrace.Fatal(msgString(msg))
 			}
 		}
 	}
@@ -235,7 +255,7 @@ func (s *server) generateConnID() int {
 }
 
 func msgString(m Message) string {
-	var name, payload string
+	var name, payload, hash string
 	switch m.Type {
 	case MsgConnect:
 		name = "Connect"
@@ -245,5 +265,5 @@ func msgString(m Message) string {
 	case MsgAck:
 		name = "Ack"
 	}
-	return fmt.Sprintf("[%s %d %d %s]", name, m.ConnID, m.SeqNum, payload)
+	return fmt.Sprintf("[%s %d %d %s %v]", name, m.ConnID, m.SeqNum, payload, hash)
 }
