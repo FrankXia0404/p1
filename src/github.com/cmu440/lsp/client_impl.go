@@ -25,7 +25,9 @@ type client struct {
 	readBufferChan  chan Message
 	conn            *lspnet.UDPConn
 	serverAddr      *lspnet.UDPAddr
-	seqOrg *SeqOrganizor
+	seqOrg          *seqOrganizer
+	win             *slidingWindow
+	params          *Params
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -57,6 +59,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		readBufferChan:  make(chan Message),
 		conn:            conn,
 		serverAddr:      raddr,
+		params:          params,
 	}
 
 	go client.writeToServer()
@@ -70,7 +73,7 @@ func (c *client) connect() (Client, error) {
 	msg := NewConnect()
 	ltrace.Println("Attempt to connect")
 
-	c.writeBufferChan <- *msg
+	c.outMsgChan <- *msg
 	if isConnected, open := <-c.connectChan; open {
 		if isConnected {
 			return c, nil
@@ -123,13 +126,20 @@ func (c *client) handleConnection() {
 					c.connID = msg.ConnID
 					c.nextSeqNum = INIT_SEQ_NUM + 1
 
-					seqOrg, err := NewSeqOrganizor(c.readBufferChan, INIT_SEQ_NUM + 1)
+					// sequence organizer
+					seqOrg, err := NewSeqOrganizer(c.readBufferChan, INIT_SEQ_NUM+1)
 					if err != nil {
 						ltrace.Println(err)
 						break
 					}
 					c.seqOrg = seqOrg
+
+					// window
+					win, err := newWindow(c.outMsgChan, c.params.WindowSize, c.nextSeqNum)
+					c.win = win
 					c.connectChan <- true
+				} else {
+					c.win.ack(msg)
 				}
 			case MsgData:
 				c.seqOrg.AddMsg(msg)
@@ -138,7 +148,7 @@ func (c *client) handleConnection() {
 				c.outMsgChan <- *ackMsg
 			}
 		case msg := <-c.writeBufferChan:
-			c.outMsgChan <- msg
+			c.win.addMsg(msg)
 		}
 	}
 }
