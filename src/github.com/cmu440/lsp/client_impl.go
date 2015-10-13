@@ -109,6 +109,7 @@ func (c *client) readFromServer() {
 			continue
 		}
 
+		ltrace.Printf("Client%d Read: %v", c.connID, msgString(msg))
 		c.inMsgChan <- msg
 	}
 }
@@ -148,7 +149,7 @@ func (c *client) ConnID() int {
 
 func (c *client) Read() ([]byte, error) {
 	if msg, open := <-c.readBufferChan; open {
-		ltrace.Printf("Client%d Read: %v", c.connID, msgString(msg))
+
 		return msg.Payload, nil
 	} else {
 		return nil, errors.New("Channel closed")
