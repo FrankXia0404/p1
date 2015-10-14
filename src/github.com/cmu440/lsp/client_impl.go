@@ -9,6 +9,7 @@ import (
 	"github.com/cmu440/lspnet"
 	"reflect"
 	"strconv"
+	"time"
 )
 
 const (
@@ -27,7 +28,9 @@ type client struct {
 	serverAddr      *lspnet.UDPAddr
 	seqOrg          *SeqOrganizor
 	wind            *slidingWindow
-	params          *Params
+	params          Params
+	resetEpochCountChan chan bool
+	epochCountChan chan int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -41,6 +44,8 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, params *Params) (Client, error) {
+	ltrace.Println(params)
+
 	raddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -59,12 +64,16 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		readBufferChan:  make(chan Message),
 		conn:            conn,
 		serverAddr:      raddr,
-		params:          params,
+		params:          *params,
+		resetEpochCountChan: make(chan bool),
+		epochCountChan: make(chan int),
 	}
 
 	go client.writeToServer()
 	go client.readFromServer()
 	go client.handleConnection()
+
+	go epoch(client.resetEpochCountChan, time.Duration(client.params.EpochMillis) * time.Millisecond, client.fireEpoch, client.epochCountChan)
 
 	return client.connect()
 }
@@ -78,7 +87,7 @@ func (c *client) initSeq() {
 }
 
 func (c *client) initWindow() {
-	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM+1)
+	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM+1, "C" + strconv.Itoa(c.connID))
 	if err != nil {
 		ltrace.Fatal(err)
 	}
@@ -87,7 +96,6 @@ func (c *client) initWindow() {
 
 func (c *client) connect() (Client, error) {
 	msg := NewConnect()
-	ltrace.Println("Attempt to connect")
 
 	c.outMsgChan <- *msg
 	if isConnected, open := <-c.connectChan; open {
@@ -109,7 +117,13 @@ func (c *client) writeToServer() {
 		if err != nil {
 			ltrace.Println(err)
 		}
-		ltrace.Printf("Client%d Write: %v", c.connID, msgString(msg))
+		switch msg.Type {
+		case MsgConnect:
+			ltrace.Printf("Client attempts to connect: %v", msgString(msg))
+		default:
+			ltrace.Printf("C%d Write: %v", c.connID, msgString(msg))
+		}
+
 		c.conn.Write(buf)
 	}
 }
@@ -130,7 +144,8 @@ func (c *client) readFromServer() {
 			continue
 		}
 
-		ltrace.Printf("Client%d Read: %v", c.connID, msgString(msg))
+		ltrace.Printf("C%d Read: %v", c.connID, msgString(msg))
+		c.resetEpochCountChan <- true
 		c.inMsgChan <- msg
 	}
 }
@@ -142,6 +157,7 @@ func (c *client) handleConnection() {
 			switch msg.Type {
 			case MsgAck:
 				if msg.SeqNum == INIT_SEQ_NUM {
+					ltrace.Printf("C%d connID changed :%d", c.connID, msg.ConnID)
 					c.connID = msg.ConnID
 					c.nextSeqNum = INIT_SEQ_NUM + 1
 					c.connectChan <- true
@@ -157,6 +173,11 @@ func (c *client) handleConnection() {
 			}
 		case msg := <-c.writeBufferChan:
 			c.wind.AddMsg(msg)
+		case epochCount:= <-c.epochCountChan:
+			ltrace.Printf("Epoch C%d: %v Count: %d/%d", c.connID, c.params, epochCount, c.params.EpochLimit)
+			if epochCount >= c.params.EpochLimit {
+				c.resetEpochCountChan <- false
+			}
 		}
 	}
 }
@@ -204,4 +225,8 @@ func IsMsgIntegrated(msg *Message) bool {
 	default:
 		return true
 	}
+}
+
+func (c *client) fireEpoch() {
+	c.wind.FireEpoch()
 }

@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 )
 
 const (
@@ -30,7 +31,9 @@ type clientInfo struct {
 	outMsgChan chan Message
 	seqOrg     *SeqOrganizor
 	wind       *slidingWindow
-	params     *Params
+	params     Params
+	resetEpochCountChan chan bool
+	epochCountChan      chan int
 }
 
 type server struct {
@@ -43,7 +46,7 @@ type server struct {
 	closeConnIdChan      chan int
 	connIdCloseErrorChan chan error
 	connIDGenerator      chan int
-	params               *Params
+	params               Params
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -73,7 +76,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		connIdCloseErrorChan: make(chan error),
 		clients:              make(map[int]*clientInfo),
 		connIDGenerator:      connIDs(),
-		params:               params,
+		params:               *params,
 	}
 	go s.readFromClients()
 	go s.handleServerEvents()
@@ -98,11 +101,11 @@ func (s *server) readFromClients() {
 
 		switch msg.Type {
 		case MsgConnect:
-
 			s.newClientAddrChan <- clientAddr
 		default:
 			if c, ok := s.clients[msg.ConnID]; ok {
 				ltrace.Printf("Server revc from C%d: %v", c.connID, msgString(msg))
+				c.resetEpochCountChan <- true
 				c.inMsgChan <- msg
 			} else {
 				ltrace.Println("ConnID not found: ", c.connID)
@@ -159,6 +162,8 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 		inMsgChan:  make(chan Message),
 		outMsgChan: make(chan Message),
 		params: s.params,
+		resetEpochCountChan: make(chan bool),
+		epochCountChan:      make(chan int),
 	}
 	// sequence
 	seqOrg, err := NewSeqOrganizor(s.recvMsgChan, INIT_SEQ_NUM+1)
@@ -168,7 +173,7 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 	c.seqOrg = seqOrg
 
 	// Sliding window
-	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM + 1)
+	wind, err := newWindow(c.outMsgChan, c.params.WindowSize, INIT_SEQ_NUM + 1, "Server C" + strconv.Itoa(c.connID))
 	if err != nil {
 		ltrace.Fatal(err)
 	}
@@ -177,6 +182,7 @@ func (s *server) addClient(clienAddr *lspnet.UDPAddr) {
 	s.clients[c.connID] = &c
 
 	go s.handleClientEvents(c.connID)
+	go epochServer(c.connID, c.resetEpochCountChan, time.Duration(s.params.EpochMillis)*time.Millisecond, s.fireEpoch, c.epochCountChan)
 
 	ltrace.Printf("Server new conn %d: %v", c.connID, clienAddr)
 	c.outMsgChan <- *NewAck(c.connID, INIT_SEQ_NUM)
@@ -193,14 +199,20 @@ func (s *server) handleClientEvents(connId int) {
 		case msg := <-c.inMsgChan:
 			switch msg.Type {
 			case MsgData:
-				c.seqOrg.AddMsg(msg)
+				go c.seqOrg.AddMsg(msg)
 				ackMsg := NewAck(msg.ConnID, msg.SeqNum)
+				ltrace.Printf("Server C%d wirte: %v", c.connID, msgString(*ackMsg))
 				buf, _ := json.Marshal(ackMsg)
 				s.serverConn.WriteToUDP(buf, c.clientAddr)
 			case MsgAck:
-				c.wind.Ack(msg)
+				go c.wind.Ack(msg)
 			case MsgConnect:
 				ltrace.Fatal(msgString(msg))
+			}
+		case epochCount :=<-c.epochCountChan:
+			ltrace.Printf("Server Epoch C%d: %v Count: %d/%d", c.connID, c.params, epochCount, c.params.EpochLimit)
+			if epochCount >= c.params.EpochLimit {
+				c.resetEpochCountChan <- false
 			}
 		}
 	}
@@ -266,4 +278,9 @@ func msgString(m Message) string {
 		name = "Ack"
 	}
 	return fmt.Sprintf("[%s %d %d %s %v]", name, m.ConnID, m.SeqNum, payload, hash)
+}
+
+func (s *server) fireEpoch(connId int) {
+	c := s.clients[connId]
+	c.wind.FireEpoch()
 }

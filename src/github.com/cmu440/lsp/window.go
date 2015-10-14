@@ -1,6 +1,7 @@
 package lsp
 
 type slidingWindow struct {
+	debugStr string
 	packets    []packet
 	outMsgChan chan<- Message
 	minSeqNum  int
@@ -20,6 +21,7 @@ const (
 	WindAppend = iota
 	WindAck
 	WindUpdate
+	WindEpoch
 )
 
 type windRequest struct {
@@ -28,13 +30,14 @@ type windRequest struct {
 	retChan chan error
 }
 
-func newWindow(outMsgChan chan Message, winSize, initSeq int) (*slidingWindow, error) {
+func newWindow(outMsgChan chan Message, winSize, initSeq int, debugStr string) (*slidingWindow, error) {
 	w := &slidingWindow{
 		packets:    make([]packet, 0),
 		outMsgChan: outMsgChan,
 		minSeqNum:  initSeq,
 		winSize:    winSize,
 		reqChan:    make(chan windRequest),
+		debugStr: debugStr,
 	}
 	go w.runWindow()
 	return w, nil
@@ -46,12 +49,17 @@ func (w *slidingWindow) runWindow() {
 		case req := <-w.reqChan:
 			switch req.reqType {
 			case WindAppend:
+				if (req.param.SeqNum < w.minSeqNum) {
+					req.retChan <- nil
+					break
+				}
 				p := packet{
 					msg:     req.param,
 					isSent:  false,
 					isAcked: false,
 				}
 				w.packets = append(w.packets, p)
+				w.updateWindow()
 				req.retChan <- nil
 			case WindAck:
 				ackMsg := req.param
@@ -59,11 +67,15 @@ func (w *slidingWindow) runWindow() {
 					req.retChan <- nil
 					break
 				}
-				offset := ackMsg.SeqNum - w.minSeqNum
-				w.packets[offset].isAcked = true
+				i := ackMsg.SeqNum - w.minSeqNum
+				w.packets[i].isAcked = true
+				w.updateWindow()
 				req.retChan <- nil
 			case WindUpdate:
 				w.updateWindow()
+				req.retChan <- nil
+			case WindEpoch:
+				w.fireEpoch()
 				req.retChan <- nil
 			}
 		}
@@ -79,12 +91,6 @@ func (w *slidingWindow) Ack(acMsg Message) error {
 func (w *slidingWindow) AddMsg(msg Message) error {
 	errChan := make(chan error)
 	w.reqChan <- windRequest{reqType: WindAppend, param: msg, retChan: errChan}
-
-	if err := <-errChan; err != nil {
-		return err
-	}
-
-	w.reqChan <- windRequest{reqType: WindUpdate, retChan: errChan}
 	return <-errChan
 }
 
@@ -108,6 +114,18 @@ func (w *slidingWindow) updateWindow() {
 	w.packets = w.packets[offset:]
 	w.minSeqNum += offset
 	w.sendMsgs()
+}
 
-	ltrace.Printf("Window size: %d %v", len(w.packets), w.packets)
+func (w *slidingWindow) fireEpoch() {
+	for i := 0; i < len(w.packets) && i < w.winSize; i++ {
+		if w.packets[i].isSent && !w.packets[i].isAcked {
+			w.outMsgChan <- w.packets[i].msg
+		}
+	}
+}
+
+func (w *slidingWindow) FireEpoch() error{
+	errChan := make(chan error)
+	w.reqChan <- windRequest{reqType: WindEpoch, retChan: errChan}
+	return <-errChan
 }
